@@ -77,7 +77,7 @@ func NewConn(c net.Conn, bandwidth int, minLatency, maxLatency time.Duration, pa
 		Conn:              c,
 		minLatency:        minLatency,
 		maxLatency:        maxLatency,
-		packetLossRate:    packetLossRate,
+		packetLossRate:    packetLossRate / 2.0, // divide by 2 because it applies in both directions
 		writeDeadline:     time.Time{},
 		closer:            make(chan bool, 1),
 		closed:            false,
@@ -246,10 +246,15 @@ func (c *conn) doSimRead(start int, finish int) {
 		case <-c.closer:
 			return
 		case readPacket := <-c.intermediateDownQueue:
-			select {
-			case c.downQueue <- readPacket:
-			default:
-				// up queue full, drop packet
+			if c.rand.Float64() >= c.packetLossRate {
+				go func() {
+					time.Sleep(c.minLatency + time.Duration(float64(c.maxLatency-c.minLatency)*c.rand.Float64()))
+					select {
+					case c.downQueue <- readPacket:
+					default:
+						// up queue full, drop packet
+					}
+				}()
 			}
 
 			bytesAvailableToRead -= len(readPacket)
