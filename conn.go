@@ -161,9 +161,14 @@ func (c *conn) Write(b []byte) (int, error) {
 func (c *conn) Close() error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	close(c.closer)
-	c.closed = true
-	return c.Conn.Close()
+
+	if !c.closed {
+		close(c.closer)
+		c.closed = true
+		return c.Conn.Close()
+	}
+
+	return nil
 }
 
 func (c *conn) SetDeadline(t time.Time) error {
