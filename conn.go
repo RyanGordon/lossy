@@ -1,6 +1,8 @@
 package lossy
 
 import (
+	"errors"
+	"fmt"
 	"math/rand"
 	"net"
 	"sync"
@@ -14,11 +16,26 @@ type conn struct {
 	packetLossRate    float64
 	writeDeadline     time.Time
 	closed            bool
+	closer            chan bool
 	mu                *sync.Mutex
 	rand              *rand.Rand
 	throttleMu        *sync.Mutex
 	timeToWaitPerByte float64
 	headerOverhead    int
+	mtuSize           int
+
+	// Sim Read
+	simUpInitialTime    time.Time
+	simUp               map[int]int
+	simMaxUpMs          int64
+	intermediateUpQueue chan []byte
+	upQueue             chan []byte
+
+	// Sim Down
+	simDownInitialTime time.Time
+	simDown            map[int]int
+	simMaxDownMs       int64
+	downQueue          chan []byte
 }
 
 // NewConn wraps the given net.Conn with a lossy connection.
@@ -38,51 +55,113 @@ type conn struct {
 // headerOverhead is the header size of the underlying protocol of the connection.
 // It is used to simulate bandwidth more realistically.
 // If bandwidth is unlimited, headerOverhead is ignored.
-func NewConn(c net.Conn, bandwidth int, minLatency, maxLatency time.Duration, packetLossRate float64, headerOverhead int) net.Conn {
+func NewConn(c net.Conn, bandwidth int, minLatency, maxLatency time.Duration, packetLossRate float64, headerOverhead int, mtuSize int, simUpFile string, simDownFile string) net.Conn {
 	var timeToWaitPerByte float64
 	if bandwidth <= 0 {
 		timeToWaitPerByte = 0
 	} else {
 		timeToWaitPerByte = float64(time.Second) / float64(bandwidth)
 	}
-	return &conn{
+
+	simUp, simMaxUpMs, err := readSaturatorTrace(simUpFile)
+	if err != nil {
+		panic(err)
+	}
+
+	simDown, simMaxDownMs, err := readSaturatorTrace(simDownFile)
+	if err != nil {
+		panic(err)
+	}
+
+	netConn := &conn{
 		Conn:              c,
 		minLatency:        minLatency,
 		maxLatency:        maxLatency,
 		packetLossRate:    packetLossRate,
 		writeDeadline:     time.Time{},
+		closer:            make(chan bool, 1),
 		closed:            false,
 		mu:                &sync.Mutex{},
 		rand:              rand.New(rand.NewSource(time.Now().UnixNano())),
 		throttleMu:        &sync.Mutex{},
 		timeToWaitPerByte: timeToWaitPerByte,
 		headerOverhead:    headerOverhead,
+		mtuSize:           mtuSize,
+
+		simUpInitialTime:    time.Now(),
+		simUp:               simUp,
+		simMaxUpMs:          simMaxUpMs,
+		intermediateUpQueue: make(chan []byte, 10000000),
+		upQueue:             make(chan []byte, 10000000),
+
+		simDownInitialTime: time.Now(),
+		simDown:            simDown,
+		simMaxDownMs:       simMaxDownMs,
+		downQueue:          make(chan []byte, 10000000),
 	}
+
+	if len(netConn.simUp) > 0 {
+		go netConn.backgroundSimIntermediateReader()
+		go netConn.backgroundSimReader()
+	} else {
+		go netConn.backgroundReader()
+	}
+
+	if len(netConn.simDown) > 0 {
+		go netConn.backgroundSimWriter()
+	}
+
+	return netConn
+}
+
+func (c *conn) Read(b []byte) (int, error) {
+	bCap := cap(b)
+
+	var read []byte
+	select {
+	case read = <-c.upQueue:
+	case <-c.closer:
+		return 0, fmt.Errorf("Conn closed")
+	}
+
+	readLen := len(read)
+	if bCap < readLen {
+		readLen = bCap
+	}
+
+	for i := 0; i < readLen; i++ {
+		b[i] = read[i]
+	}
+
+	return readLen, nil
 }
 
 func (c *conn) Write(b []byte) (int, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+
 	if c.closed || !c.writeDeadline.Equal(time.Time{}) && c.writeDeadline.Before(time.Now()) {
 		return c.Conn.Write(b)
 	}
-	go func() {
-		c.throttleMu.Lock()
-		time.Sleep(time.Duration(c.timeToWaitPerByte * (float64(len(b) + c.headerOverhead))))
-		c.throttleMu.Unlock()
-		if c.rand.Float64() >= c.packetLossRate {
-			time.Sleep(c.minLatency + time.Duration(float64(c.maxLatency-c.minLatency)*c.rand.Float64()))
-			c.mu.Lock()
-			_, _ = c.Conn.Write(b)
-			c.mu.Unlock()
+
+	if len(c.simDown) > 0 {
+		select {
+		case c.downQueue <- b:
+			return len(b), nil
+		default:
+			return 0, errors.New("Write queue full")
 		}
-	}()
+	} else {
+		go c.doWrite(b)
+	}
+
 	return len(b), nil
 }
 
 func (c *conn) Close() error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	close(c.closer)
 	c.closed = true
 	return c.Conn.Close()
 }
@@ -99,4 +178,157 @@ func (c *conn) SetWriteDeadline(t time.Time) error {
 	defer c.mu.Unlock()
 	c.writeDeadline = t
 	return c.Conn.SetWriteDeadline(t)
+}
+
+func (c *conn) backgroundSimIntermediateReader() {
+	for {
+		select {
+		case <-c.closer:
+			return
+		default:
+			b := make([]byte, c.mtuSize)
+			n, err := c.Conn.Read(b)
+			if err != nil {
+				return
+			}
+
+			c.intermediateUpQueue <- b[:n]
+		}
+	}
+}
+
+func (c *conn) backgroundSimReader() {
+	lastTime := c.simUpInitialTime
+	for {
+		select {
+		case <-c.closer:
+			return
+		case <-time.After(1 * time.Millisecond):
+			now := time.Now()
+			betweenStartMs := lastTime.Sub(c.simUpInitialTime).Milliseconds()
+			betweenFinishMs := now.Sub(c.simUpInitialTime).Milliseconds()
+
+			// Allows to loop the trace file back from the start
+			if betweenStartMs > c.simMaxUpMs || betweenFinishMs > c.simMaxUpMs {
+				c.simUpInitialTime = lastTime
+				betweenStartMs = lastTime.Sub(c.simUpInitialTime).Milliseconds()
+				betweenFinishMs = now.Sub(c.simUpInitialTime).Milliseconds()
+			}
+
+			c.doSimRead(int(betweenStartMs), int(betweenFinishMs))
+			lastTime = now
+		}
+	}
+}
+
+func (c *conn) doSimRead(start int, finish int) {
+	totalToRead := 0
+	for i := start; i < finish; i++ {
+		if count, exists := c.simUp[i]; exists {
+			totalToRead += count
+		}
+	}
+
+	if totalToRead == 0 {
+		return
+	}
+
+	// Pull these many packets
+	for j := 0; j < totalToRead; j++ {
+		select {
+		case <-c.closer:
+			return
+		case readPacket := <-c.intermediateUpQueue:
+			select {
+			case c.upQueue <- readPacket:
+			default:
+				// up queue full, drop packet
+			}
+		default:
+			// Nothing left in queue -> underflowing read bandwidth
+			return
+		}
+	}
+}
+
+func (c *conn) backgroundReader() {
+	for {
+		select {
+		case <-c.closer:
+			return
+		default:
+			b := make([]byte, c.mtuSize)
+			n, err := c.Conn.Read(b)
+			if err != nil {
+				return
+			}
+
+			c.upQueue <- b[:n]
+		}
+	}
+}
+
+func (c *conn) backgroundSimWriter() {
+	lastTime := c.simDownInitialTime
+	for {
+		select {
+		case <-c.closer:
+			return
+		case <-time.After(1 * time.Millisecond):
+			now := time.Now()
+			betweenStartMs := lastTime.Sub(c.simDownInitialTime).Milliseconds()
+			betweenFinishMs := now.Sub(c.simDownInitialTime).Milliseconds()
+
+			// Allows to loop the trace file back from the start
+			if betweenStartMs > c.simMaxDownMs || betweenFinishMs > c.simMaxDownMs {
+				c.simDownInitialTime = lastTime
+				betweenStartMs = lastTime.Sub(c.simDownInitialTime).Milliseconds()
+				betweenFinishMs = now.Sub(c.simDownInitialTime).Milliseconds()
+			}
+
+			c.doSimWrite(int(betweenStartMs), int(betweenFinishMs))
+			lastTime = now
+		}
+	}
+}
+
+func (c *conn) doSimWrite(start int, finish int) {
+	totalToWrite := 0
+	for i := start; i < finish; i++ {
+		if count, exists := c.simUp[i]; exists {
+			totalToWrite += count
+		}
+	}
+
+	if totalToWrite == 0 {
+		return
+	}
+
+	// Write these many packets
+	for j := 0; j < totalToWrite; j++ {
+		select {
+		case <-c.closer:
+			return
+		case writePacket := <-c.downQueue:
+			go c.doWrite(writePacket)
+		default:
+			// Nothing left in queue -> underflowing write bandwidth
+			return
+		}
+	}
+}
+
+func (c *conn) doWrite(b []byte) {
+	if c.timeToWaitPerByte > 0 {
+		c.throttleMu.Lock()
+		time.Sleep(time.Duration(c.timeToWaitPerByte * (float64(len(b) + c.headerOverhead))))
+		c.throttleMu.Unlock()
+	}
+
+	if c.rand.Float64() >= c.packetLossRate {
+		time.Sleep(c.minLatency + time.Duration(float64(c.maxLatency-c.minLatency)*c.rand.Float64()))
+		c.mu.Lock()
+		_, _ = c.Conn.Write(b)
+		c.mu.Unlock()
+	}
 }

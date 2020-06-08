@@ -3,12 +3,13 @@ package lossy_test
 import (
 	"bytes"
 	"fmt"
-	"github.com/cevatbarisyilmaz/lossy"
 	"math/rand"
 	"net"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/cevatbarisyilmaz/lossy"
 )
 
 func getConnections() (net.PacketConn, net.Conn, error) {
@@ -53,7 +54,7 @@ func TestBandwidth(t *testing.T) {
 			t.Error(err)
 		}
 	}()
-	c = lossy.NewConn(c, bandwidth, 0, 0, 0, headerOverhead)
+	c = lossy.NewConn(c, bandwidth, 0, 0, 0, headerOverhead, 1500, "", "")
 	pc = lossy.NewPacketConn(pc, bandwidth, 0, 0, 0, headerOverhead)
 	var messages [][]byte
 	for i := 0; i < messageCount; i++ {
@@ -145,7 +146,7 @@ func TestLatency(t *testing.T) {
 			t.Error(err)
 		}
 	}()
-	c = lossy.NewConn(c, 0, minLatency, maxLatency, 0, 0)
+	c = lossy.NewConn(c, 0, minLatency, maxLatency, 0, 0, 1500, "", "")
 	pc = lossy.NewPacketConn(pc, 0, minLatency, maxLatency, 0, 0)
 	var messages [][]byte
 	for i := 0; i < messageCount; i++ {
@@ -245,7 +246,7 @@ func TestPacketLoss(t *testing.T) {
 			t.Error(err)
 		}
 	}()
-	c = lossy.NewConn(c, 0, 0, 0, packetLossRate, 0)
+	c = lossy.NewConn(c, 0, 0, 0, packetLossRate, 0, 1500, "", "")
 	pc = lossy.NewPacketConn(pc, 0, 0, 0, packetLossRate, 0)
 	var messages [][]byte
 	for i := 0; i < messageCount; i++ {
@@ -338,7 +339,7 @@ func TestErrors(t *testing.T) {
 		t.Fatal(err)
 	}
 	pc = lossy.NewPacketConn(pc, 0, 0, 0, 0, 0)
-	c = lossy.NewConn(c, 0, 0, 0, 0, 0)
+	c = lossy.NewConn(c, 0, 0, 0, 0, 0, 1500, "", "")
 
 	err = c.SetWriteDeadline(time.Now())
 	if err != nil {
