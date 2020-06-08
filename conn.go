@@ -304,7 +304,7 @@ func (c *conn) backgroundSimWriter() {
 func (c *conn) doSimWrite(start int, finish int) {
 	totalToWrite := 0
 	for i := start; i < finish; i++ {
-		if count, exists := c.simUp[i]; exists {
+		if count, exists := c.simDown[i]; exists {
 			totalToWrite += count
 		}
 	}
