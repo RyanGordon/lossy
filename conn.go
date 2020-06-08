@@ -247,7 +247,7 @@ func (c *conn) doSimRead(start int, finish int) {
 			return
 		case readPacket := <-c.intermediateDownQueue:
 			select {
-			case c.upQueue <- readPacket:
+			case c.downQueue <- readPacket:
 			default:
 				// up queue full, drop packet
 			}
@@ -272,7 +272,7 @@ func (c *conn) backgroundReader() {
 				return
 			}
 
-			c.upQueue <- b[:n]
+			c.downQueue <- b[:n]
 		}
 	}
 }
