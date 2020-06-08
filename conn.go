@@ -233,8 +233,10 @@ func (c *conn) doSimRead(start int, finish int) {
 		return
 	}
 
-	// Pull these many packets
-	for j := 0; j < totalToRead; j++ {
+	bytesAvailableToRead := totalToRead * 1500
+
+	// Pull these many bytes
+	for bytesAvailableToRead > 0 {
 		select {
 		case <-c.closer:
 			return
@@ -244,6 +246,8 @@ func (c *conn) doSimRead(start int, finish int) {
 			default:
 				// up queue full, drop packet
 			}
+
+			bytesAvailableToRead -= len(readPacket)
 		default:
 			// Nothing left in queue -> underflowing read bandwidth
 			return
@@ -304,12 +308,15 @@ func (c *conn) doSimWrite(start int, finish int) {
 		return
 	}
 
-	// Write these many packets
-	for j := 0; j < totalToWrite; j++ {
+	bytesAvailableToWrite := totalToWrite * 1500
+
+	// Write up to these many bytes
+	for bytesAvailableToWrite > 0 {
 		select {
 		case <-c.closer:
 			return
 		case writePacket := <-c.downQueue:
+			bytesAvailableToWrite -= len(writePacket)
 			go c.doWrite(writePacket)
 		default:
 			// Nothing left in queue -> underflowing write bandwidth
