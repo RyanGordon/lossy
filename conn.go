@@ -25,17 +25,17 @@ type conn struct {
 	mtuSize           int
 
 	// Sim Read
-	simUpInitialTime    time.Time
-	simUp               map[int]int
-	simMaxUpMs          int64
-	intermediateUpQueue chan []byte
-	upQueue             chan []byte
+	simUpInitialTime time.Time
+	simUp            map[int]int
+	simMaxUpMs       int64
+	upQueue          chan []byte
 
 	// Sim Down
-	simDownInitialTime time.Time
-	simDown            map[int]int
-	simMaxDownMs       int64
-	downQueue          chan []byte
+	simDownInitialTime    time.Time
+	simDown               map[int]int
+	simMaxDownMs          int64
+	intermediateDownQueue chan []byte
+	downQueue             chan []byte
 }
 
 // NewConn wraps the given net.Conn with a lossy connection.
@@ -88,26 +88,26 @@ func NewConn(c net.Conn, bandwidth int, minLatency, maxLatency time.Duration, pa
 		headerOverhead:    headerOverhead,
 		mtuSize:           mtuSize,
 
-		simUpInitialTime:    time.Now(),
-		simUp:               simUp,
-		simMaxUpMs:          simMaxUpMs,
-		intermediateUpQueue: make(chan []byte, 10000000),
-		upQueue:             make(chan []byte, 10000000),
+		simUpInitialTime: time.Now(),
+		simUp:            simUp,
+		simMaxUpMs:       simMaxUpMs,
+		upQueue:          make(chan []byte, 10000000),
 
-		simDownInitialTime: time.Now(),
-		simDown:            simDown,
-		simMaxDownMs:       simMaxDownMs,
-		downQueue:          make(chan []byte, 10000000),
+		simDownInitialTime:    time.Now(),
+		simDown:               simDown,
+		simMaxDownMs:          simMaxDownMs,
+		intermediateDownQueue: make(chan []byte, 10000000),
+		downQueue:             make(chan []byte, 10000000),
 	}
 
-	if len(netConn.simUp) > 0 {
+	if len(netConn.simDown) > 0 {
 		go netConn.backgroundSimIntermediateReader()
 		go netConn.backgroundSimReader()
 	} else {
 		go netConn.backgroundReader()
 	}
 
-	if len(netConn.simDown) > 0 {
+	if len(netConn.simUp) > 0 {
 		go netConn.backgroundSimWriter()
 	}
 
@@ -119,7 +119,7 @@ func (c *conn) Read(b []byte) (int, error) {
 
 	var read []byte
 	select {
-	case read = <-c.upQueue:
+	case read = <-c.downQueue:
 	case <-c.closer:
 		return 0, fmt.Errorf("Conn closed")
 	}
@@ -144,9 +144,9 @@ func (c *conn) Write(b []byte) (int, error) {
 		return c.Conn.Write(b)
 	}
 
-	if len(c.simDown) > 0 {
+	if len(c.simUp) > 0 {
 		select {
-		case c.downQueue <- b:
+		case c.upQueue <- b:
 			return len(b), nil
 		default:
 			return 0, errors.New("Write queue full")
@@ -197,27 +197,27 @@ func (c *conn) backgroundSimIntermediateReader() {
 				return
 			}
 
-			c.intermediateUpQueue <- b[:n]
+			c.intermediateDownQueue <- b[:n]
 		}
 	}
 }
 
 func (c *conn) backgroundSimReader() {
-	lastTime := c.simUpInitialTime
+	lastTime := c.simDownInitialTime
 	for {
 		select {
 		case <-c.closer:
 			return
 		case <-time.After(1 * time.Millisecond):
 			now := time.Now()
-			betweenStartMs := lastTime.Sub(c.simUpInitialTime).Milliseconds()
-			betweenFinishMs := now.Sub(c.simUpInitialTime).Milliseconds()
+			betweenStartMs := lastTime.Sub(c.simDownInitialTime).Milliseconds()
+			betweenFinishMs := now.Sub(c.simDownInitialTime).Milliseconds()
 
 			// Allows to loop the trace file back from the start
-			if betweenStartMs > c.simMaxUpMs || betweenFinishMs > c.simMaxUpMs {
-				c.simUpInitialTime = lastTime
-				betweenStartMs = lastTime.Sub(c.simUpInitialTime).Milliseconds()
-				betweenFinishMs = now.Sub(c.simUpInitialTime).Milliseconds()
+			if betweenStartMs > c.simMaxDownMs || betweenFinishMs > c.simMaxDownMs {
+				c.simDownInitialTime = lastTime
+				betweenStartMs = lastTime.Sub(c.simDownInitialTime).Milliseconds()
+				betweenFinishMs = now.Sub(c.simDownInitialTime).Milliseconds()
 			}
 
 			c.doSimRead(int(betweenStartMs), int(betweenFinishMs))
@@ -229,7 +229,7 @@ func (c *conn) backgroundSimReader() {
 func (c *conn) doSimRead(start int, finish int) {
 	totalToRead := 0
 	for i := start; i < finish; i++ {
-		if count, exists := c.simUp[i]; exists {
+		if count, exists := c.simDown[i]; exists {
 			totalToRead += count
 		}
 	}
@@ -245,7 +245,7 @@ func (c *conn) doSimRead(start int, finish int) {
 		select {
 		case <-c.closer:
 			return
-		case readPacket := <-c.intermediateUpQueue:
+		case readPacket := <-c.intermediateDownQueue:
 			select {
 			case c.upQueue <- readPacket:
 			default:
@@ -278,21 +278,21 @@ func (c *conn) backgroundReader() {
 }
 
 func (c *conn) backgroundSimWriter() {
-	lastTime := c.simDownInitialTime
+	lastTime := c.simUpInitialTime
 	for {
 		select {
 		case <-c.closer:
 			return
 		case <-time.After(1 * time.Millisecond):
 			now := time.Now()
-			betweenStartMs := lastTime.Sub(c.simDownInitialTime).Milliseconds()
-			betweenFinishMs := now.Sub(c.simDownInitialTime).Milliseconds()
+			betweenStartMs := lastTime.Sub(c.simUpInitialTime).Milliseconds()
+			betweenFinishMs := now.Sub(c.simUpInitialTime).Milliseconds()
 
 			// Allows to loop the trace file back from the start
-			if betweenStartMs > c.simMaxDownMs || betweenFinishMs > c.simMaxDownMs {
-				c.simDownInitialTime = lastTime
-				betweenStartMs = lastTime.Sub(c.simDownInitialTime).Milliseconds()
-				betweenFinishMs = now.Sub(c.simDownInitialTime).Milliseconds()
+			if betweenStartMs > c.simMaxUpMs || betweenFinishMs > c.simMaxUpMs {
+				c.simUpInitialTime = lastTime
+				betweenStartMs = lastTime.Sub(c.simUpInitialTime).Milliseconds()
+				betweenFinishMs = now.Sub(c.simUpInitialTime).Milliseconds()
 			}
 
 			c.doSimWrite(int(betweenStartMs), int(betweenFinishMs))
@@ -304,7 +304,7 @@ func (c *conn) backgroundSimWriter() {
 func (c *conn) doSimWrite(start int, finish int) {
 	totalToWrite := 0
 	for i := start; i < finish; i++ {
-		if count, exists := c.simDown[i]; exists {
+		if count, exists := c.simUp[i]; exists {
 			totalToWrite += count
 		}
 	}
@@ -320,7 +320,7 @@ func (c *conn) doSimWrite(start int, finish int) {
 		select {
 		case <-c.closer:
 			return
-		case writePacket := <-c.downQueue:
+		case writePacket := <-c.upQueue:
 			bytesAvailableToWrite -= len(writePacket)
 			go c.doWrite(writePacket)
 		default:
