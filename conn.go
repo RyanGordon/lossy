@@ -27,12 +27,14 @@ type conn struct {
 	// Sim Read
 	simUpInitialTime time.Time
 	simUp            map[int]int
+	simUpOrdered     []int
 	simMaxUpMs       int64
 	upQueue          chan []byte
 
 	// Sim Down
 	simDownInitialTime    time.Time
 	simDown               map[int]int
+	simDownOrdered        []int
 	simMaxDownMs          int64
 	intermediateDownQueue chan []byte
 	downQueue             chan []byte
@@ -63,12 +65,12 @@ func NewConn(c net.Conn, bandwidth int, minLatency, maxLatency time.Duration, pa
 		timeToWaitPerByte = float64(time.Second) / float64(bandwidth)
 	}
 
-	simUp, simMaxUpMs, err := readSaturatorTrace(simUpFile)
+	simUp, simUpOrdered, simMaxUpMs, err := readSaturatorTrace(simUpFile)
 	if err != nil {
 		panic(err)
 	}
 
-	simDown, simMaxDownMs, err := readSaturatorTrace(simDownFile)
+	simDown, simDownOrdered, simMaxDownMs, err := readSaturatorTrace(simDownFile)
 	if err != nil {
 		panic(err)
 	}
@@ -90,11 +92,13 @@ func NewConn(c net.Conn, bandwidth int, minLatency, maxLatency time.Duration, pa
 
 		simUpInitialTime: time.Now(),
 		simUp:            simUp,
+		simUpOrdered:     simUpOrdered,
 		simMaxUpMs:       simMaxUpMs,
 		upQueue:          make(chan []byte, 10000000),
 
 		simDownInitialTime:    time.Now(),
 		simDown:               simDown,
+		simDownOrdered:        simDownOrdered,
 		simMaxDownMs:          simMaxDownMs,
 		intermediateDownQueue: make(chan []byte, 10000000),
 		downQueue:             make(chan []byte, 10000000),
@@ -203,42 +207,51 @@ func (c *conn) backgroundSimIntermediateReader() {
 }
 
 func (c *conn) backgroundSimReader() {
-	lastTime := c.simDownInitialTime
-	for {
-		select {
-		case <-c.closer:
-			return
-		case <-time.After(1 * time.Millisecond):
-			now := time.Now()
-			betweenStartMs := lastTime.Sub(c.simDownInitialTime).Milliseconds()
-			betweenFinishMs := now.Sub(c.simDownInitialTime).Milliseconds()
+	fireAtAbsoluteTime := c.simDownInitialTime
 
-			// Allows to loop the trace file back from the start
-			if betweenStartMs > c.simMaxDownMs || betweenFinishMs > c.simMaxDownMs {
-				c.simDownInitialTime = lastTime
-				betweenStartMs = lastTime.Sub(c.simDownInitialTime).Milliseconds()
-				betweenFinishMs = now.Sub(c.simDownInitialTime).Milliseconds()
+	orderedAbsoluteReadTimes := c.simDownOrdered
+	packetsToReadAtAbsTime := c.simDown
+
+	for {
+		var previousTimeMs int = 0
+		for i, absoluteTimeMs := range orderedAbsoluteReadTimes {
+			packetsToRead := packetsToReadAtAbsTime[absoluteTimeMs]
+
+			var relativeTimeMs int = 0
+			if i != 0 {
+				relativeTimeMs = absoluteTimeMs - previousTimeMs
 			}
 
-			c.doSimRead(int(betweenStartMs), int(betweenFinishMs))
-			lastTime = now
+			relativeTimeNanos := relativeTimeMs * 1e6
+			fireAtAbsoluteTime = fireAtAbsoluteTime.Add(time.Duration(relativeTimeNanos))
+			relativeCorrectedFireDuration := fireAtAbsoluteTime.Sub(time.Now())
+			if relativeCorrectedFireDuration < 0 {
+				/*if i != 0 {
+					// CPU Constrained! We can't make realtime adjustments quick enough to keep up...
+				}*/
+
+				fireAtAbsoluteTime = time.Now()
+				relativeCorrectedFireDuration = 0 * time.Millisecond
+			}
+
+			select {
+			case <-c.closer:
+				return
+			case <-time.After(relativeCorrectedFireDuration):
+				c.doSimRead(packetsToRead)
+			}
+
+			previousTimeMs = absoluteTimeMs
 		}
 	}
 }
 
-func (c *conn) doSimRead(start int, finish int) {
-	totalToRead := 0
-	for i := start; i < finish; i++ {
-		if count, exists := c.simDown[i]; exists {
-			totalToRead += count
-		}
-	}
-
-	if totalToRead == 0 {
+func (c *conn) doSimRead(packetsToRead int) {
+	if packetsToRead == 0 {
 		return
 	}
 
-	bytesAvailableToRead := totalToRead * 1500
+	bytesAvailableToRead := packetsToRead * 1500
 
 	// Pull these many bytes
 	for bytesAvailableToRead > 0 {
@@ -252,7 +265,7 @@ func (c *conn) doSimRead(start int, finish int) {
 					select {
 					case c.downQueue <- readPacket:
 					default:
-						// up queue full, drop packet
+						// read queue full, drop packet
 					}
 				}()
 			}
@@ -283,42 +296,51 @@ func (c *conn) backgroundReader() {
 }
 
 func (c *conn) backgroundSimWriter() {
-	lastTime := c.simUpInitialTime
-	for {
-		select {
-		case <-c.closer:
-			return
-		case <-time.After(1 * time.Millisecond):
-			now := time.Now()
-			betweenStartMs := lastTime.Sub(c.simUpInitialTime).Milliseconds()
-			betweenFinishMs := now.Sub(c.simUpInitialTime).Milliseconds()
+	fireAtAbsoluteTime := c.simUpInitialTime
 
-			// Allows to loop the trace file back from the start
-			if betweenStartMs > c.simMaxUpMs || betweenFinishMs > c.simMaxUpMs {
-				c.simUpInitialTime = lastTime
-				betweenStartMs = lastTime.Sub(c.simUpInitialTime).Milliseconds()
-				betweenFinishMs = now.Sub(c.simUpInitialTime).Milliseconds()
+	orderedAbsoluteWriteTimes := c.simUpOrdered
+	packetsToWriteAtAbsTime := c.simUp
+
+	for {
+		var previousTimeMs int = 0
+		for i, absoluteTimeMs := range orderedAbsoluteWriteTimes {
+			packetsToWrite := packetsToWriteAtAbsTime[absoluteTimeMs]
+
+			var relativeTimeMs int = 0
+			if i != 0 {
+				relativeTimeMs = absoluteTimeMs - previousTimeMs
 			}
 
-			c.doSimWrite(int(betweenStartMs), int(betweenFinishMs))
-			lastTime = now
+			relativeTimeNanos := relativeTimeMs * 1e6
+			fireAtAbsoluteTime = fireAtAbsoluteTime.Add(time.Duration(relativeTimeNanos))
+			relativeCorrectedFireDuration := fireAtAbsoluteTime.Sub(time.Now())
+			if relativeCorrectedFireDuration < 0 {
+				/*if i != 0 {
+					// CPU Constrained! We can't make realtime adjustments quick enough to keep up...
+				}*/
+
+				fireAtAbsoluteTime = time.Now()
+				relativeCorrectedFireDuration = 0 * time.Millisecond
+			}
+
+			select {
+			case <-c.closer:
+				return
+			case <-time.After(relativeCorrectedFireDuration):
+				c.doSimWrite(packetsToWrite)
+			}
+
+			previousTimeMs = absoluteTimeMs
 		}
 	}
 }
 
-func (c *conn) doSimWrite(start int, finish int) {
-	totalToWrite := 0
-	for i := start; i < finish; i++ {
-		if count, exists := c.simUp[i]; exists {
-			totalToWrite += count
-		}
-	}
-
-	if totalToWrite == 0 {
+func (c *conn) doSimWrite(packetsToWrite int) {
+	if packetsToWrite == 0 {
 		return
 	}
 
-	bytesAvailableToWrite := totalToWrite * 1500
+	bytesAvailableToWrite := packetsToWrite * 1500
 
 	// Write up to these many bytes
 	for bytesAvailableToWrite > 0 {

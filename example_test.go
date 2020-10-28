@@ -2,14 +2,16 @@ package lossy_test
 
 import (
 	"fmt"
-	"github.com/cevatbarisyilmaz/lossy"
 	"log"
 	"math/rand"
 	"net"
+	"testing"
 	"time"
+
+	"github.com/cevatbarisyilmaz/lossy"
 )
 
-func Example() {
+func TestExample(t *testing.T) {
 	packetConn, err := net.ListenUDP("udp", &net.UDPAddr{
 		IP:   net.IPv4(127, 0, 0, 1),
 		Port: 0,
@@ -21,7 +23,7 @@ func Example() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	lossyConn := lossy.NewConn(conn, 1024, time.Second, time.Second*2, 0.25, lossy.UDPv4MinHeaderOverhead)
+	lossyConn := lossy.NewConn(conn, 0, 25*time.Millisecond, 200*time.Millisecond, 0.02, lossy.UDPv4MinHeaderOverhead, 1500, "./traces/ATT-LTE-driving.down.txt", "./traces/ATT-LTE-driving.up.txt")
 	var bytesWritten int
 	const packetCount = 32
 	go func() {
