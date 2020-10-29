@@ -94,14 +94,14 @@ func NewConn(c net.Conn, bandwidth int, minLatency, maxLatency time.Duration, pa
 		simUp:            simUp,
 		simUpOrdered:     simUpOrdered,
 		simMaxUpMs:       simMaxUpMs,
-		upQueue:          make(chan []byte, 10000000),
+		upQueue:          make(chan []byte, 100000),
 
 		simDownInitialTime:    time.Now(),
 		simDown:               simDown,
 		simDownOrdered:        simDownOrdered,
 		simMaxDownMs:          simMaxDownMs,
-		intermediateDownQueue: make(chan []byte, 10000000),
-		downQueue:             make(chan []byte, 10000000),
+		intermediateDownQueue: make(chan []byte, 100000),
+		downQueue:             make(chan []byte, 100000),
 	}
 
 	if len(netConn.simDown) > 0 {
